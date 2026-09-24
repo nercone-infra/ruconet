@@ -25,8 +25,29 @@ node_peer() {
     fi
 }
 
+node_underlay() {
+    ROUTE=$(ip -4 route show default table main | head -n 1)
+    GATEWAY=$(echo "${ROUTE}" | awk '{ for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }')
+    DEVICE=$(echo "${ROUTE}" | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+    if [ -z "${DEVICE}" ]; then
+        ruconet_log "no default route in the main table"
+        return 1
+    fi
+    LIMIT=$((MTU + RUCONET_OVERHEAD))
+    LINK=$(cat "/sys/class/net/${DEVICE}/mtu")
+    if [ "${LINK}" -lt "${LIMIT}" ]; then
+        LIMIT="${LINK}"
+    fi
+    if [ -n "${GATEWAY}" ]; then
+        ip route replace default via "${GATEWAY}" dev "${DEVICE}" mtu "${LIMIT}" table main
+    else
+        ip route replace default dev "${DEVICE}" mtu "${LIMIT}" table main
+    fi
+}
+
 node_routing() {
     node_tunnel || return 0
+    node_underlay
     ip route replace default dev "${RUCONET_INTERFACE}" table "${RUCONET_TABLE}"
     for RESOLVER in ${RESOLVERS}; do
         ruconet_rule to "${RESOLVER%%@*}" ipproto tcp dport 853 lookup main priority 900
