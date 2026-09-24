@@ -20,7 +20,7 @@ fetch() {
     curl -fsS --max-time 30 --proto =https \
         --tlsv1.2 \
         --ciphers ECDHE-ECDSA-AES256-GCM-SHA384 \
-        --tls13-ciphers TLS_AES_256_GCM_SHA384 \
+        --tls13-ciphers TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256 \
         --curves X25519MLKEM768:SecP384r1MLKEM1024:SecP256r1MLKEM768:MLKEM1024:MLKEM768:secp384r1:secp256r1 \
         --sigalgs ecdsa_secp384r1_sha384 \
         "$@"
