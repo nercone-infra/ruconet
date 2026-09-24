@@ -48,8 +48,10 @@ jobs:
           OPENSSL_VERSION=$(echo "${OPENSSL_VERSIONS}" | tail -1)
           OPENSSL3_VERSION=$(echo "${OPENSSL_VERSIONS}" | grep -E '^3\.' | tail -1)
 
-          MAIN_HASH=$(curl -fsSL "http://deb.debian.org/debian/dists/trixie/Release" | awk '/^SHA256:/{in_sha=1; next} in_sha && / main\/binary-amd64\/Packages$/{print $1; exit}')
-          SECURITY_HASH=$(curl -fsSL "https://security.debian.org/debian-security/dists/trixie-security/Release" | awk '/^SHA256:/{in_sha=1; next} in_sha && / main\/binary-amd64\/Packages$/{print $1; exit}')
+          MAIN_RELEASE=$(curl -fsSL "http://deb.debian.org/debian/dists/trixie/Release")
+          MAIN_HASH=$(awk '/^SHA256:/{in_sha=1; next} in_sha && / main\/binary-amd64\/Packages$/{print $1; exit}' <<< "${MAIN_RELEASE}")
+          SECURITY_RELEASE=$(curl -fsSL "https://security.debian.org/debian-security/dists/trixie-security/Release")
+          SECURITY_HASH=$(awk '/^SHA256:/{in_sha=1; next} in_sha && / main\/binary-amd64\/Packages$/{print $1; exit}' <<< "${SECURITY_RELEASE}")
           TRIXIE_PACKAGES_VERSION="${MAIN_HASH:0:16}-${SECURITY_HASH:0:16}"
 
           for VALUE in "${NGINX_VERSION}" "${OPENSSL_VERSION}" "${OPENSSL3_VERSION}" "${MAIN_HASH}" "${SECURITY_HASH}"; do
