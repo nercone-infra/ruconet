@@ -1,0 +1,150 @@
+#!/bin/sh
+set -u
+set -f
+
+CERTS=/etc/certs
+TRUST="${CERTS}/.trust.pem"
+BUNDLES="${CERT_BUNDLES:-ruconet}"
+INTERVAL="${CERT_INTERVAL:-3600}"
+RETRY="${CERT_RETRY:-60}"
+
+. /etc/ruconet/network
+
+URL="https://cert.${DOMAIN}"
+
+log() {
+    echo "cert: $*" >&2
+}
+
+fetch() {
+    curl -fsS --max-time 30 --proto =https \
+        --tlsv1.2 \
+        --ciphers ECDHE-ECDSA-AES256-GCM-SHA384 \
+        --tls13-ciphers TLS_AES_256_GCM_SHA384 \
+        --curves X25519MLKEM768:SecP384r1MLKEM1024:SecP256r1MLKEM768:MLKEM1024:MLKEM768:secp384r1:secp256r1 \
+        --sigalgs ecdsa_secp384r1_sha384 \
+        "$@"
+}
+
+fetch_trusted() {
+    fetch --cacert "${TRUST}" "$@"
+}
+
+fetch_authenticated() {
+    fetch --cacert "${TRUST}" --cert "${CERTS}/ruconet/cert.pem" --key "${CERTS}/ruconet/key.pem" "$@"
+}
+
+workspace() {
+    (umask 077 && mktemp -d "${CERTS}/.tmp.XXXXXX")
+}
+
+install() {
+    TARGET=".${1}.$(date -u +%Y%m%d%H%M%S%N)"
+    chmod 700 "$2"
+    mv "$2" "${CERTS}/${TARGET}"
+    ln -sfn "${TARGET}" "${CERTS}/.${1}.link"
+    mv -T "${CERTS}/.${1}.link" "${CERTS}/${1}"
+    find "${CERTS}" -mindepth 1 -maxdepth 1 -type d -name ".${1}.[0-9]*" | sort | head -n -2 | xargs -r rm -rf
+    log "installed ${1}"
+}
+
+matches() {
+    [ "$(openssl x509 -in "$1" -noout -pubkey 2> /dev/null)" = "$(openssl pkey -in "$2" -pubout 2> /dev/null)" ]
+}
+
+expiring() {
+    START=$(date -d "$(openssl x509 -in "$1" -noout -startdate | cut -d = -f 2)" +%s)
+    END=$(date -d "$(openssl x509 -in "$1" -noout -enddate | cut -d = -f 2)" +%s)
+    [ $((END - $(date +%s))) -lt $(((END - START) / 3)) ]
+}
+
+trust() {
+    DIRECTORY=$(workspace)
+    if [ -s "${TRUST}" ]; then
+        fetch_trusted -o "${DIRECTORY}/ca.pem" "${URL}/ca.pem" || { rm -rf "${DIRECTORY}"; return 1; }
+    else
+        fetch --insecure -o "${DIRECTORY}/unverified.pem" "${URL}/ca.pem" || { rm -rf "${DIRECTORY}"; return 1; }
+        fetch --cacert "${DIRECTORY}/unverified.pem" -o "${DIRECTORY}/ca.pem" "${URL}/ca.pem" || { rm -rf "${DIRECTORY}"; return 1; }
+        cmp -s "${DIRECTORY}/unverified.pem" "${DIRECTORY}/ca.pem" || { rm -rf "${DIRECTORY}"; return 1; }
+        log "trusting $(openssl x509 -in "${DIRECTORY}/ca.pem" -noout -subject -fingerprint -sha256)"
+    fi
+    openssl x509 -in "${DIRECTORY}/ca.pem" -noout || { rm -rf "${DIRECTORY}"; return 1; }
+    cmp -s "${DIRECTORY}/ca.pem" "${TRUST}" || mv "${DIRECTORY}/ca.pem" "${TRUST}"
+    rm -rf "${DIRECTORY}"
+}
+
+bundle_ruconet() {
+    if [ -e "${CERTS}/ruconet/cert.pem" ] \
+        && cmp -s "${CERTS}/ruconet/ca.pem" "${TRUST}" \
+        && openssl verify -CAfile "${TRUST}" "${CERTS}/ruconet/cert.pem" > /dev/null 2>&1 \
+        && ! expiring "${CERTS}/ruconet/cert.pem"; then
+        return 0
+    fi
+    set --
+    if [ -e "${CERTS}/ruconet/cert.pem" ] && openssl verify -CAfile "${TRUST}" "${CERTS}/ruconet/cert.pem" > /dev/null 2>&1; then
+        set -- --cert "${CERTS}/ruconet/cert.pem" --key "${CERTS}/ruconet/key.pem"
+    fi
+    DIRECTORY=$(workspace)
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "${DIRECTORY}/key.pem" 2> /dev/null \
+        && openssl req -new -key "${DIRECTORY}/key.pem" -subj "/CN=ruconet" -sha384 -out "${DIRECTORY}/request.pem" \
+        && fetch_trusted "$@" -H "Content-Type: application/pkcs10" --data-binary "@${DIRECTORY}/request.pem" -o "${DIRECTORY}/cert.pem" "${URL}/ruconet" \
+        && openssl verify -CAfile "${TRUST}" -purpose sslserver "${DIRECTORY}/cert.pem" > /dev/null \
+        && openssl verify -CAfile "${TRUST}" -purpose sslclient "${DIRECTORY}/cert.pem" > /dev/null \
+        && matches "${DIRECTORY}/cert.pem" "${DIRECTORY}/key.pem" \
+        && cp "${TRUST}" "${DIRECTORY}/ca.pem" \
+        && rm "${DIRECTORY}/request.pem" \
+        || { rm -rf "${DIRECTORY}"; return 1; }
+    install ruconet "${DIRECTORY}"
+}
+
+bundle_letsencrypt() {
+    DIRECTORY=$(workspace)
+    fetch_authenticated -o "${DIRECTORY}/fullchain.pem" "${URL}/letsencrypt/fullchain.pem" \
+        && fetch_authenticated -o "${DIRECTORY}/privkey.pem" "${URL}/letsencrypt/privkey.pem" \
+        && matches "${DIRECTORY}/fullchain.pem" "${DIRECTORY}/privkey.pem" \
+        || { rm -rf "${DIRECTORY}"; return 1; }
+    if cmp -s "${DIRECTORY}/fullchain.pem" "${CERTS}/letsencrypt/fullchain.pem" && cmp -s "${DIRECTORY}/privkey.pem" "${CERTS}/letsencrypt/privkey.pem"; then
+        rm -rf "${DIRECTORY}"
+        return 0
+    fi
+    install letsencrypt "${DIRECTORY}"
+}
+
+synchronize() {
+    trust || { log "failed to fetch the RucoNet CA from ${URL}"; return 1; }
+    RESULT=0
+    for BUNDLE in ${BUNDLES}; do
+        case "${BUNDLE}" in
+            ruconet|letsencrypt) "bundle_${BUNDLE}" || { log "failed to update ${BUNDLE}"; RESULT=1; } ;;
+            *) log "unknown bundle ${BUNDLE}"; RESULT=1 ;;
+        esac
+    done
+    return "${RESULT}"
+}
+
+health() {
+    for BUNDLE in ${BUNDLES}; do
+        [ -d "${CERTS}/${BUNDLE}" ] || return 1
+    done
+}
+
+main() {
+    trap 'exit 0' TERM INT
+    mkdir -p "${CERTS}"
+    chmod 700 "${CERTS}"
+    find "${CERTS}" -mindepth 1 -maxdepth 1 -name ".tmp.*" -exec rm -rf {} +
+    while true; do
+        if synchronize; then
+            DELAY="${INTERVAL}"
+        else
+            DELAY="${RETRY}"
+        fi
+        sleep "${DELAY}" & wait $!
+    done
+}
+
+case "${1:-main}" in
+    main)   main ;;
+    health) health ;;
+    *)      echo "Usage: $0 [main|health]" >&2; exit 2 ;;
+esac

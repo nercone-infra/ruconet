@@ -1,0 +1,13 @@
+PREFIX=10.64.0.0/24
+DOMAIN=ruconet.internal
+
+HUB=ruconet
+ENDPOINT=ruconet.nercone.dev
+PORT=51820
+
+EGRESS=gateway
+
+MTU=1380
+KEEPALIVE=25
+
+RESOLVERS="1.1.1.1@853#cloudflare-dns.com 1.0.0.1@853#cloudflare-dns.com"

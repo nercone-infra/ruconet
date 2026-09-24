@@ -1,0 +1,206 @@
+#!/bin/sh
+set -u
+set -f
+
+. /usr/local/lib/ruconet.sh
+
+NAME="${RUCONET_NAME:?RUCONET_NAME is required}"
+DIRECT="${RUCONET_DIRECT:-}"
+HANDSHAKE="${RUCONET_HANDSHAKE:-180}"
+
+node_tunnel() {
+    [ "${DIRECT}" != "all" ]
+}
+
+node_peer() {
+    printf '[Interface]\nPrivateKey = %s\n' "${RUCONET_PRIVATE_KEY}"
+    if node_tunnel; then
+        printf 'FwMark = %s\n' "${RUCONET_TABLE}"
+    fi
+    printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nPersistentKeepalive = %s\n' "${RUCONET_HUB_PUBLIC_KEY}" "${RUCONET_PRESHARED_KEY}" "${KEEPALIVE}"
+    if node_tunnel; then
+        printf 'AllowedIPs = 0.0.0.0/0\n'
+    else
+        printf 'AllowedIPs = %s\n' "${PREFIX}"
+    fi
+}
+
+node_routing() {
+    node_tunnel || return 0
+    ip route replace default dev "${RUCONET_INTERFACE}" table "${RUCONET_TABLE}"
+    for RESOLVER in ${RESOLVERS}; do
+        ruconet_rule to "${RESOLVER%%@*}" ipproto tcp dport 853 lookup main priority 900
+    done
+    for SERVICE in ${DIRECT}; do
+        case "${SERVICE}" in
+            tcp/[0-9]*|udp/[0-9]*)
+                ruconet_rule ipproto "${SERVICE%%/*}" dport "${SERVICE#*/}" lookup main priority 900
+                ;;
+            *)
+                ruconet_log "invalid direct service ${SERVICE}"
+                ;;
+        esac
+    done
+    ruconet_rule not fwmark "${RUCONET_TABLE}" lookup "${RUCONET_TABLE}" priority 1000
+}
+
+node_firewall() {
+    node_tunnel || return 0
+    nft -f - <<EOF
+table inet ruconet
+delete table inet ruconet
+table inet ruconet {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        iifname "${RUCONET_INTERFACE}" accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+}
+EOF
+}
+
+node_resolver() {
+    cat <<EOF
+server:
+    do-ip6: no
+    tls-cert-bundle: "/etc/ssl/certs/ca-certificates.crt"
+    trust-anchor-file: "/usr/share/dns/root.key"
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+$(for RESOLVER in ${RESOLVERS}; do printf '    forward-addr: %s\n' "${RESOLVER}"; done)
+EOF
+}
+
+node_unbound() {
+    ruconet_unbound
+    cat <<EOF
+
+server:
+    interface: 127.0.0.1
+    access-control: 127.0.0.0/8 allow
+
+    qname-minimisation: yes
+    prefetch: yes
+    serve-expired: yes
+    infra-keep-probing: yes
+    infra-host-ttl: 60
+
+    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+EOF
+    for ZONE in "${DOMAIN}" "$(ruconet_reverse)"; do
+        cat <<EOF
+
+server:
+    local-zone: "${ZONE}." transparent
+    domain-insecure: "${ZONE}."
+
+forward-zone:
+    name: "${ZONE}."
+    forward-addr: ${HUB_ADDRESS}
+EOF
+    done
+}
+
+node_start() {
+    mkdir -p /var/lib/unbound
+    [ -s /var/lib/unbound/root.key ] || cp /usr/share/dns/root.key /var/lib/unbound/root.key
+    ruconet_unbound_start
+}
+
+node_stop() {
+    ruconet_unbound_stop
+    exit 0
+}
+
+node_endpoint() {
+    case "${ENDPOINT}" in
+        *[!0-9.]*) ;;
+        *) echo "${ENDPOINT}"; return 0 ;;
+    esac
+    case "${ENDPOINT}" in
+        *:*) echo "[${ENDPOINT}]"; return 0 ;;
+    esac
+    if ip -4 route show default table main | grep -q .; then
+        ENDPOINT_ADDRESS=$(unbound-host -C "${RUCONET_RUN}/resolver.conf" -t A "${ENDPOINT}" 2> /dev/null | awk '/ has address / && !/BOGUS/ { for (i = 1; i < NF; i++) if ($i == "address") { print $(i + 1); exit } }')
+        [ -n "${ENDPOINT_ADDRESS}" ] && { echo "${ENDPOINT_ADDRESS}"; return 0; }
+    fi
+    if ip -6 route show default table main | grep -q .; then
+        ENDPOINT_ADDRESS=$(unbound-host -C "${RUCONET_RUN}/resolver.conf" -t AAAA "${ENDPOINT}" 2> /dev/null | awk '/ has IPv6 address / && !/BOGUS/ { for (i = 1; i < NF; i++) if ($i == "address") { print $(i + 1); exit } }')
+        [ -n "${ENDPOINT_ADDRESS}" ] && { echo "[${ENDPOINT_ADDRESS}]"; return 0; }
+    fi
+    return 1
+}
+
+node_connect() {
+    NEXT=$(node_endpoint) || { ruconet_log "failed to resolve ${ENDPOINT}"; return 1; }
+    if [ "${NEXT}" != "${CURRENT}" ]; then
+        wg set "${RUCONET_INTERFACE}" peer "${RUCONET_HUB_PUBLIC_KEY}" endpoint "${NEXT}:${PORT}" || return 1
+        ruconet_log "hub endpoint ${NEXT}:${PORT}"
+        CURRENT="${NEXT}"
+    fi
+}
+
+node_apply() {
+    ruconet_load
+    ADDRESS=$(ruconet_address "${NAME}")
+    HUB_ADDRESS=$(ruconet_address "${HUB}")
+    if [ -z "${ADDRESS}" ] || [ -z "${HUB_ADDRESS}" ]; then
+        ruconet_log "${NAME} or ${HUB} has no address in ruconet/etc/members"
+        return 1
+    fi
+    ruconet_interface "${ADDRESS}"
+    (umask 077 && node_peer > "${RUCONET_RUN}/wireguard.conf")
+    wg syncconf "${RUCONET_INTERFACE}" "${RUCONET_RUN}/wireguard.conf" || return 1
+    node_resolver > "${RUCONET_RUN}/resolver.conf"
+    node_unbound > "${RUCONET_RUN}/unbound.conf"
+    ruconet_log "node ${NAME} (${ADDRESS}) joined ${PREFIX} via ${HUB} (${HUB_ADDRESS})"
+}
+
+node_handshake() {
+    LATEST=$(wg show "${RUCONET_INTERFACE}" latest-handshakes 2> /dev/null | awk '{ print $2; exit }')
+    [ -n "${LATEST}" ] && [ "${LATEST}" -gt 0 ] && [ $(($(date +%s) - LATEST)) -lt "${HANDSHAKE}" ]
+}
+
+node_health() {
+    ip link show "${RUCONET_INTERFACE}" up > /dev/null 2>&1 \
+        && [ -e "${RUCONET_RUN}/ready" ] \
+        && node_handshake \
+        && ruconet_unbound_health
+}
+
+node_main() {
+    : "${RUCONET_PRIVATE_KEY:?RUCONET_PRIVATE_KEY is required}"
+    : "${RUCONET_PRESHARED_KEY:?RUCONET_PRESHARED_KEY is required}"
+    : "${RUCONET_HUB_PUBLIC_KEY:?RUCONET_HUB_PUBLIC_KEY is required}"
+    trap node_stop TERM INT
+    mkdir -p "${RUCONET_RUN}"
+    rm -f "${RUCONET_RUN}/ready"
+    ruconet_log "${NAME} public key: $(ruconet_public_key)"
+
+    CURRENT=
+    node_apply || exit 1
+    node_routing
+    node_firewall
+    node_connect
+    node_start
+
+    while true; do
+        node_connect
+        ruconet_unbound_watch
+        touch "${RUCONET_RUN}/ready"
+        sleep 30 & wait $!
+    done
+}
+
+case "${1:-main}" in
+    main)   node_main ;;
+    health) node_health ;;
+    *)      echo "Usage: $0 [main|health]" >&2; exit 2 ;;
+esac

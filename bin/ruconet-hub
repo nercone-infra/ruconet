@@ -1,0 +1,223 @@
+#!/bin/sh
+set -u
+set -f
+
+. /usr/local/lib/ruconet.sh
+
+NAME="${RUCONET_NAME:-}"
+
+hub_registered() {
+    ruconet_members | while read -r MEMBER ADDRESS; do
+        if [ "${MEMBER}" != "${NAME}" ] && [ -n "$(ruconet_peer_public_key "${MEMBER}")" ] && [ -n "$(ruconet_peer_preshared_key "${MEMBER}")" ]; then
+            echo "${MEMBER} ${ADDRESS}"
+        fi
+    done
+}
+
+hub_peers() {
+    printf '[Interface]\nPrivateKey = %s\nListenPort = %s\n' "${RUCONET_PRIVATE_KEY}" "${PORT}"
+    hub_registered | while read -r MEMBER ADDRESS; do
+        ALLOWED="${ADDRESS}/32"
+        if [ "${MEMBER}" = "${EGRESS}" ]; then
+            ALLOWED="${ALLOWED}, 0.0.0.0/0"
+        fi
+        printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' "$(ruconet_peer_public_key "${MEMBER}")" "$(ruconet_peer_preshared_key "${MEMBER}")" "${ALLOWED}"
+    done
+}
+
+hub_rules() {
+    ruconet_policy | while read -r SOURCE DESTINATION SERVICES; do
+        if [ "${SOURCE}" = "*" ]; then
+            SOURCES=$(ruconet_members | awk -v destination="${DESTINATION}" '$1 != destination { print $1 }')
+        else
+            SOURCES="${SOURCE}"
+        fi
+        if [ "${DESTINATION}" = "internet" ]; then
+            TARGET="ip daddr != ${PREFIX}"
+        else
+            TARGET_ADDRESS=$(ruconet_address "${DESTINATION}")
+            if [ -z "${TARGET_ADDRESS}" ]; then
+                ruconet_log "policy: unknown destination ${DESTINATION}"
+                continue
+            fi
+            TARGET="ip daddr ${TARGET_ADDRESS}"
+        fi
+        for MEMBER in ${SOURCES}; do
+            SOURCE_ADDRESS=$(ruconet_address "${MEMBER}")
+            if [ -z "${SOURCE_ADDRESS}" ]; then
+                ruconet_log "policy: unknown source ${MEMBER}"
+                continue
+            fi
+            if [ -z "${SERVICES}" ]; then
+                printf '        ip saddr %s %s accept\n' "${SOURCE_ADDRESS}" "${TARGET}"
+                continue
+            fi
+            for SERVICE in ${SERVICES}; do
+                case "${SERVICE}" in
+                    tcp/[0-9]*|udp/[0-9]*)
+                        printf '        ip saddr %s %s %s dport %s accept\n' "${SOURCE_ADDRESS}" "${TARGET}" "${SERVICE%%/*}" "${SERVICE#*/}"
+                        ;;
+                    *)
+                        ruconet_log "policy: invalid service ${SERVICE}"
+                        ;;
+                esac
+            done
+        done
+    done
+}
+
+hub_unregistered() {
+    REGISTERED=$(hub_registered | awk '{ print $2 }' | paste -s -d , -)
+    if [ -n "${REGISTERED}" ]; then
+        printf '        ip daddr %s ip daddr != { %s } reject with icmpx type host-unreachable\n' "${PREFIX}" "${REGISTERED}"
+    else
+        printf '        ip daddr %s reject with icmpx type host-unreachable\n' "${PREFIX}"
+    fi
+}
+
+hub_firewall() {
+    cat <<EOF
+table inet ruconet
+delete table inet ruconet
+table inet ruconet {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        iifname != "${RUCONET_INTERFACE}" udp dport ${PORT} accept
+        iifname "${RUCONET_INTERFACE}" ip daddr ${ADDRESS} meta l4proto { tcp, udp } th dport 53 accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        iifname != "${RUCONET_INTERFACE}" drop
+        oifname != "${RUCONET_INTERFACE}" drop
+        ct state established,related accept
+        ct state invalid drop
+$(hub_unregistered)
+$(hub_rules)
+        ip daddr ${PREFIX} reject with icmpx type admin-prohibited
+    }
+}
+EOF
+}
+
+hub_unbound() {
+    ruconet_unbound
+    cat <<EOF
+
+server:
+    interface: ${ADDRESS}
+    access-control: ${PREFIX} allow
+
+    local-zone: "." refuse
+    local-zone: "${DOMAIN}." static
+    local-zone: "$(ruconet_reverse)." static
+    include: "${RUCONET_RUN}/members.conf"
+EOF
+}
+
+hub_members() {
+    ruconet_members | while read -r MEMBER MEMBER_ADDRESS; do
+        printf '    local-data: "%s.%s. %s IN A %s"\n' "${MEMBER}" "${DOMAIN}" "${RUCONET_TTL}" "${MEMBER_ADDRESS}"
+        printf '    local-data-ptr: "%s %s %s.%s."\n' "${MEMBER_ADDRESS}" "${RUCONET_TTL}" "${MEMBER}" "${DOMAIN}"
+    done
+}
+
+hub_apply() {
+    ruconet_load
+    ADDRESS=$(ruconet_address "${NAME}")
+    if [ -z "${ADDRESS}" ]; then
+        ruconet_log "${NAME} has no address in ruconet/etc/members"
+        return 1
+    fi
+    for MEMBER in $(ruconet_invalid); do
+        ruconet_log "members: invalid name ${MEMBER}"
+    done
+    for MEMBER in $(ruconet_members | awk -v name="${NAME}" '$1 != name { print $1 }'); do
+        if [ -z "$(ruconet_peer_public_key "${MEMBER}")" ] || [ -z "$(ruconet_peer_preshared_key "${MEMBER}")" ]; then
+            ruconet_log "${MEMBER} is not registered: set $(ruconet_variable "${MEMBER}" PUBLIC_KEY) and $(ruconet_variable "${MEMBER}" PRESHARED_KEY)"
+        fi
+    done
+    mkdir -p "${RUCONET_RUN}"
+    ruconet_interface "${ADDRESS}"
+    (umask 077 && hub_peers > "${RUCONET_RUN}/wireguard.conf")
+    wg syncconf "${RUCONET_INTERFACE}" "${RUCONET_RUN}/wireguard.conf" || return 1
+    hub_firewall > "${RUCONET_RUN}/firewall.nft"
+    nft -f "${RUCONET_RUN}/firewall.nft" || return 1
+    ip route replace default dev "${RUCONET_INTERFACE}" table "${RUCONET_TABLE}"
+    ruconet_rule iif "${RUCONET_INTERFACE}" lookup "${RUCONET_TABLE}" priority 1000
+    hub_unbound > "${RUCONET_RUN}/unbound.conf"
+    hub_members > "${RUCONET_RUN}/members.conf"
+    if [ "${ADDRESS}" != "${SERVING}" ]; then
+        ruconet_unbound_stop
+        ruconet_unbound_start
+        SERVING="${ADDRESS}"
+    else
+        ruconet_unbound_reload
+    fi
+    ruconet_log "hub ${NAME} (${ADDRESS}) listening on ${PORT}/udp"
+}
+
+hub_health() {
+    ip link show "${RUCONET_INTERFACE}" up > /dev/null 2>&1 \
+        && [ -e "${RUCONET_RUN}/ready" ] \
+        && ruconet_unbound_health
+}
+
+hub_stop() {
+    ruconet_unbound_stop
+    exit 0
+}
+
+hub_keygen() {
+    if [ -z "${1:-}" ]; then
+        printf 'RUCONET_PRIVATE_KEY=%s\n' "$(wg genkey)"
+        return 0
+    fi
+    case "$1" in
+        *[!a-z0-9-]*)
+            echo "Invalid name: $1" >&2
+            return 1
+            ;;
+    esac
+    : "${RUCONET_PRIVATE_KEY:?RUCONET_PRIVATE_KEY is required}"
+    PRIVATE_KEY=$(wg genkey)
+    PRESHARED_KEY=$(wg genpsk)
+    printf '# hub .env\n'
+    printf '%s=%s\n' "$(ruconet_variable "$1" PUBLIC_KEY)" "$(printf '%s\n' "${PRIVATE_KEY}" | wg pubkey)"
+    printf '%s=%s\n' "$(ruconet_variable "$1" PRESHARED_KEY)" "${PRESHARED_KEY}"
+    printf '\n# %s .env\n' "$1"
+    printf 'RUCONET_PRIVATE_KEY=%s\n' "${PRIVATE_KEY}"
+    printf 'RUCONET_PRESHARED_KEY=%s\n' "${PRESHARED_KEY}"
+    printf 'RUCONET_HUB_PUBLIC_KEY=%s\n' "$(ruconet_public_key)"
+}
+
+hub_main() {
+    : "${RUCONET_NAME:?RUCONET_NAME is required}"
+    : "${RUCONET_PRIVATE_KEY:?RUCONET_PRIVATE_KEY is required}"
+    trap hub_stop TERM INT
+    ruconet_log "${NAME} public key: $(ruconet_public_key)"
+    APPLIED=
+    SERVING=
+    while true; do
+        DIGEST=$(ruconet_digest)
+        if [ "${DIGEST}" != "${APPLIED}" ]; then
+            if hub_apply; then
+                APPLIED="${DIGEST}"
+                touch "${RUCONET_RUN}/ready"
+            else
+                ruconet_log "failed to apply registry"
+            fi
+        fi
+        ruconet_unbound_watch
+        sleep 30 & wait $!
+    done
+}
+
+case "${1:-main}" in
+    main)   hub_main ;;
+    health) hub_health ;;
+    keygen) hub_keygen "${2:-}" ;;
+    *)      echo "Usage: $0 [main|health|keygen [name]]" >&2; exit 2 ;;
+esac

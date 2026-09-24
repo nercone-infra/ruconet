@@ -1,0 +1,179 @@
+name: Build and Publish RucoNet
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-ruconet
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      nginx: ${{ steps.determine.outputs.nginx }}
+      openssl: ${{ steps.determine.outputs.openssl }}
+      openssl3: ${{ steps.determine.outputs.openssl3 }}
+      trixie: ${{ steps.determine.outputs.trixie }}
+    steps:
+      - name: Determine versions
+        id: determine
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          NGINX_VERSION=$(curl -fsSL "https://nginx.org/en/download.html" \
+            | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+            | sort -V \
+            | tail -1)
+
+          OPENSSL_VERSIONS=$(gh api repos/nercone-infra/openssl/releases --paginate --jq '.[] | select(.draft == false) | .tag_name' \
+            | grep -E '^openssl-[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/^openssl-//' \
+            | sort -V)
+          OPENSSL_VERSION=$(echo "${OPENSSL_VERSIONS}" | tail -1)
+          OPENSSL3_VERSION=$(echo "${OPENSSL_VERSIONS}" | grep -E '^3\.' | tail -1)
+
+          MAIN_HASH=$(curl -fsSL "http://deb.debian.org/debian/dists/trixie/Release" | awk '/^SHA256:/{in_sha=1; next} in_sha && / main\/binary-amd64\/Packages$/{print $1; exit}')
+          SECURITY_HASH=$(curl -fsSL "https://security.debian.org/debian-security/dists/trixie-security/Release" | awk '/^SHA256:/{in_sha=1; next} in_sha && / main\/binary-amd64\/Packages$/{print $1; exit}')
+          TRIXIE_PACKAGES_VERSION="${MAIN_HASH:0:16}-${SECURITY_HASH:0:16}"
+
+          for VALUE in "${NGINX_VERSION}" "${OPENSSL_VERSION}" "${OPENSSL3_VERSION}" "${MAIN_HASH}" "${SECURITY_HASH}"; do
+            if [ -z "${VALUE}" ]; then
+              echo "Failed to determine versions" >&2
+              exit 1
+            fi
+          done
+
+          echo "Nginx ${NGINX_VERSION}"
+          echo "OpenSSL ${OPENSSL_VERSION}"
+          echo "OpenSSL ${OPENSSL3_VERSION}"
+          echo "Packages (trixie) ${TRIXIE_PACKAGES_VERSION}"
+
+          {
+            echo "nginx=${NGINX_VERSION}"
+            echo "openssl=${OPENSSL_VERSION}"
+            echo "openssl3=${OPENSSL3_VERSION}"
+            echo "trixie=${TRIXIE_PACKAGES_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - hub
+          - node
+          - cert
+          - tls
+        platform:
+          - arch: amd64
+            os: ubuntu-24.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/${{ matrix.platform.arch }}
+          pull: true
+          build-args: |
+            NGINX_VERSION=${{ needs.version.outputs.nginx }}
+            OPENSSL_VERSION=${{ needs.version.outputs.openssl }}
+            OPENSSL3_VERSION=${{ needs.version.outputs.openssl3 }}
+            TRIXIE_PACKAGES_VERSION=${{ needs.version.outputs.trixie }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.REGISTRY }}/ruconet-${{ matrix.target }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-${{ matrix.platform.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.target }}-${{ matrix.platform.arch }}
+          path: digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - hub
+          - node
+          - cert
+          - tls
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.target }}-*
+          path: digests
+          merge-multiple: true
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish
+        working-directory: digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/ruconet-${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          SOURCES=()
+          for DIGEST in *; do
+            SOURCES+=("${IMAGE}@sha256:${DIGEST}")
+          done
+          docker buildx imagetools create -t "${IMAGE}:latest" -t "${IMAGE}:sha-${GITHUB_SHA::12}" "${SOURCES[@]}"
+          docker buildx imagetools inspect "${IMAGE}:latest"
