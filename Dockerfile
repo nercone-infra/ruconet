@@ -65,37 +65,78 @@ ARG OPENSSL3_VERSION
 
 RUN openssl-install "${OPENSSL3_VERSION}" /opt/openssl
 
-FROM debian:trixie-slim AS base
+FROM debian:trixie-slim AS ruconet-builder
 
 ARG TRIXIE_PACKAGES_VERSION
 
-RUN apt-get update && apt-get install -y --no-install-recommends wireguard-tools iproute2 nftables unbound ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates clang make libexpat1-dev \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=openssl /opt/openssl/include/ /usr/local/include/
+COPY --from=openssl /opt/openssl/lib/ /usr/local/lib/
+
+ARG UNBOUND_VERSION
+
+RUN echo "Building Unbound ${UNBOUND_VERSION}" \
+    && cd /tmp \
+    && curl -fsSL -o "unbound-${UNBOUND_VERSION}.tar.gz" "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSION}.tar.gz" \
+    && echo "$(curl -fsSL "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSION}.tar.gz.sha256")  unbound-${UNBOUND_VERSION}.tar.gz" | sha256sum -c - \
+    && tar xzf "unbound-${UNBOUND_VERSION}.tar.gz" \
+    && cd "unbound-${UNBOUND_VERSION}" \
+    && ./configure \
+        CC=clang \
+        CFLAGS="-O2" \
+        LDFLAGS="-Wl,-rpath,/usr/local/lib" \
+        --prefix=/usr/local \
+        --sysconfdir=/etc \
+        --with-ssl=/usr/local \
+        --with-pidfile= \
+        --with-rootkey-file=/var/lib/unbound/root.key \
+        --disable-static \
+    && make -j"$(nproc)" \
+    && make install DESTDIR=/opt/ruconet \
+    && rm -rf /tmp/unbound-*
+
+ARG HAPROXY_VERSION
+
+RUN echo "Building HAProxy ${HAPROXY_VERSION}" \
+    && cd /tmp \
+    && curl -fsSL -o "haproxy-${HAPROXY_VERSION}.tar.gz" "https://www.haproxy.org/download/${HAPROXY_VERSION%.*}/src/haproxy-${HAPROXY_VERSION}.tar.gz" \
+    && curl -fsSL "https://www.haproxy.org/download/${HAPROXY_VERSION%.*}/src/haproxy-${HAPROXY_VERSION}.tar.gz.sha256" | sha256sum -c - \
+    && tar xzf "haproxy-${HAPROXY_VERSION}.tar.gz" \
+    && cd "haproxy-${HAPROXY_VERSION}" \
+    && make -j"$(nproc)" \
+        CC=clang \
+        TARGET=linux-glibc \
+        USE_OPENSSL=1 \
+        SSL_INC=/usr/local/include \
+        SSL_LIB=/usr/local/lib \
+        ADDLIB="-Wl,-rpath,/usr/local/lib" \
+    && make install-bin PREFIX=/usr/local DESTDIR=/opt/ruconet \
+    && rm -rf /tmp/haproxy-*
+
+FROM debian:trixie-slim AS ruconet
+
+ARG TRIXIE_PACKAGES_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends wireguard-tools iproute2 nftables netbase libexpat1 ca-certificates dns-root-data \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=openssl /opt/openssl/bin/ /usr/local/bin/
+COPY --from=openssl /opt/openssl/lib/ /usr/local/lib/
+COPY --from=openssl /opt/openssl/ssl/ /usr/local/ssl/
+COPY --from=openssl /opt/openssl/root/ /
+COPY --from=ruconet-builder /opt/ruconet/usr/local/ /usr/local/
+
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/00-openssl.conf && ldconfig \
+    && groupadd -r unbound && useradd -r -g unbound -s /usr/sbin/nologin -d /var/lib/unbound unbound \
+    && groupadd -r haproxy && useradd -r -g haproxy -s /usr/sbin/nologin -d /nonexistent haproxy \
+    && mkdir -p /var/lib/haproxy
 
 COPY lib/ruconet.sh /usr/local/lib/ruconet.sh
-
-FROM base AS hub
-
-COPY bin/ruconet-hub /usr/local/bin/ruconet-hub
-
-STOPSIGNAL SIGTERM
-
-CMD ["/usr/local/bin/ruconet-hub"]
-
-FROM base AS node
-
-RUN apt-get update && apt-get install -y --no-install-recommends unbound-host dns-root-data \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=openssl3 /opt/openssl/bin/ /usr/local/bin/
-COPY --from=openssl3 /opt/openssl/lib/ /usr/local/lib/
-COPY --from=openssl3 /opt/openssl/ssl/ /usr/local/ssl/
-COPY --from=openssl3 /opt/openssl/root/ /
-
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/00-openssl.conf && ldconfig
-
+COPY share/haproxy.cfg /usr/local/share/ruconet/haproxy.cfg
 COPY etc/network etc/members /etc/ruconet/
-COPY bin/ruconet-node /usr/local/bin/ruconet-node
+COPY bin/ruconet-hub bin/ruconet-node /usr/local/bin/
 
 STOPSIGNAL SIGTERM
 
@@ -122,73 +163,19 @@ STOPSIGNAL SIGTERM
 
 CMD ["/usr/local/bin/cert-agent"]
 
-FROM debian:trixie-slim AS nginx-builder
+FROM python:3-slim-trixie AS ca
 
-WORKDIR /build
-
-ARG TRIXIE_PACKAGES_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates clang make libpcre2-dev zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=openssl /opt/openssl/include/ /usr/local/include/
-COPY --from=openssl /opt/openssl/lib/ /usr/local/lib/
-
-ARG NGINX_VERSION
-
-RUN echo "Building Nginx ${NGINX_VERSION}" \
-    && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" | tar xz -C /tmp \
-    && cd "/tmp/nginx-${NGINX_VERSION}" \
-    && ./configure \
-        --with-cc=clang \
-        --prefix=/etc/nginx \
-        --sbin-path=/usr/sbin/nginx \
-        --conf-path=/etc/nginx/nginx.conf \
-        --http-log-path=/var/log/nginx/access.log \
-        --error-log-path=/var/log/nginx/error.log \
-        --pid-path=/run/nginx.pid \
-        --http-client-body-temp-path=/var/cache/nginx/client_body \
-        --http-proxy-temp-path=/var/cache/nginx/proxy \
-        --http-fastcgi-temp-path=/var/cache/nginx/fastcgi \
-        --http-uwsgi-temp-path=/var/cache/nginx/uwsgi \
-        --http-scgi-temp-path=/var/cache/nginx/scgi \
-        --user=nginx \
-        --group=nginx \
-        --with-cc-opt="-I/usr/local/include -O2" \
-        --with-ld-opt="-L/usr/local/lib -Wl,-rpath,/usr/local/lib" \
-        --with-http_ssl_module \
-        --with-http_realip_module \
-        --with-stream \
-        --with-stream_ssl_module \
-        --with-stream_realip_module \
-        --with-pcre \
-        --with-pcre-jit \
-    && make -j"$(nproc)" \
-    && make install \
-    && rm -rf /tmp/nginx-*
-
-FROM debian:trixie-slim AS tls
-
-ARG TRIXIE_PACKAGES_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends libpcre2-8-0 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd -r nginx && useradd -r -g nginx -s /usr/sbin/nologin -d /nonexistent nginx
-
+COPY --from=openssl /opt/openssl/bin/ /usr/local/bin/
 COPY --from=openssl /opt/openssl/lib/ /usr/local/lib/
 COPY --from=openssl /opt/openssl/ssl/ /usr/local/ssl/
 COPY --from=openssl /opt/openssl/root/ /
-COPY --from=nginx-builder /usr/sbin/nginx /usr/sbin/nginx
-COPY --from=nginx-builder /etc/nginx/mime.types /usr/local/share/nginx/mime.types
 
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/00-openssl.conf && ldconfig \
-    && mkdir -p /etc/nginx.d /etc/certs /var/cache/nginx /var/log/nginx \
-    && chown nginx:nginx /var/cache/nginx /var/log/nginx
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/00-openssl.conf && ldconfig
 
-COPY nginx/ /etc/nginx/
-COPY bin/nginx-entrypoint /usr/local/bin/nginx-entrypoint
+WORKDIR /srv
 
-STOPSIGNAL SIGQUIT
+COPY ca/ca.py /srv/ca.py
 
-CMD ["/usr/local/bin/nginx-entrypoint"]
+STOPSIGNAL SIGTERM
+
+CMD ["python3", "-u", "/srv/ca.py"]

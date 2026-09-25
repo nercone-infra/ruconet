@@ -10,7 +10,7 @@ RETRY="${CERT_RETRY:-60}"
 
 . /etc/ruconet/network
 
-URL="https://cert.${DOMAIN}"
+URL="https://${HUB}.${DOMAIN}"
 
 log() {
     echo "cert: $*" >&2

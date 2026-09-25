@@ -15,7 +15,7 @@ hub_registered() {
 }
 
 hub_peers() {
-    printf '[Interface]\nPrivateKey = %s\nListenPort = %s\n' "${RUCONET_PRIVATE_KEY}" "${PORT}"
+    printf '[Interface]\nPrivateKey = %s\nListenPort = %s\nFwMark = %s\n' "${RUCONET_PRIVATE_KEY}" "${PORT}" "${RUCONET_TABLE}"
     hub_registered | while read -r MEMBER ADDRESS; do
         ALLOWED="${ADDRESS}/32"
         if [ "${MEMBER}" = "${EGRESS}" ]; then
@@ -75,6 +75,13 @@ hub_unregistered() {
     fi
 }
 
+hub_services() {
+    PORTS=$(ruconet_ports)
+    if [ -n "${PORTS}" ]; then
+        printf '        iifname "%s" ip daddr %s tcp dport { %s } accept\n' "${RUCONET_INTERFACE}" "${ADDRESS}" "${PORTS}"
+    fi
+}
+
 hub_firewall() {
     cat <<EOF
 table inet ruconet
@@ -86,6 +93,7 @@ table inet ruconet {
         ct state established,related accept
         iifname != "${RUCONET_INTERFACE}" udp dport ${PORT} accept
         iifname "${RUCONET_INTERFACE}" ip daddr ${ADDRESS} meta l4proto { tcp, udp } th dport 53 accept
+$(hub_services)
     }
 
     chain forward {
@@ -107,13 +115,19 @@ hub_unbound() {
     cat <<EOF
 
 server:
+    interface: 127.0.0.1
     interface: ${ADDRESS}
+    access-control: 127.0.0.0/8 allow
     access-control: ${PREFIX} allow
 
-    local-zone: "." refuse
     local-zone: "${DOMAIN}." static
     local-zone: "$(ruconet_reverse)." static
     include: "${RUCONET_RUN}/members.conf"
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+$(for RESOLVER in ${RESOLVERS}; do printf '    forward-addr: %s\n' "${RESOLVER}"; done)
 EOF
 }
 
@@ -146,7 +160,7 @@ hub_apply() {
     hub_firewall > "${RUCONET_RUN}/firewall.nft"
     nft -f "${RUCONET_RUN}/firewall.nft" || return 1
     ip route replace default dev "${RUCONET_INTERFACE}" table "${RUCONET_TABLE}"
-    ruconet_rule iif "${RUCONET_INTERFACE}" lookup "${RUCONET_TABLE}" priority 1000
+    ruconet_rule not fwmark "${RUCONET_TABLE}" lookup "${RUCONET_TABLE}" priority 1000
     hub_unbound > "${RUCONET_RUN}/unbound.conf"
     hub_members > "${RUCONET_RUN}/members.conf"
     if [ "${ADDRESS}" != "${SERVING}" ]; then
@@ -162,10 +176,12 @@ hub_apply() {
 hub_health() {
     ip link show "${RUCONET_INTERFACE}" up > /dev/null 2>&1 \
         && [ -e "${RUCONET_RUN}/ready" ] \
-        && ruconet_unbound_health
+        && ruconet_unbound_health \
+        && ruconet_haproxy_health
 }
 
 hub_stop() {
+    ruconet_haproxy_stop
     ruconet_unbound_stop
     exit 0
 }
@@ -211,6 +227,7 @@ hub_main() {
             fi
         fi
         ruconet_unbound_watch
+        [ -z "${APPLIED}" ] || ruconet_haproxy_apply
         sleep 30 & wait $!
     done
 }

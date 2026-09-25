@@ -1,6 +1,4 @@
 # SOURCE     DESTINATION   SERVICES
-*            cert          tcp/443
-
 gateway      gitea         tcp/22 tcp/443
 gateway      mail          tcp/25 tcp/143 tcp/443 tcp/10025 tcp/10080 tcp/11334
 gateway      pds           tcp/443
@@ -11,7 +9,6 @@ mail         db            tcp/5432
 mail         mail-relay    tcp/587
 pds          mail          tcp/587
 
-cert         internet
 gitea        internet
 mail         internet
 mail-relay   internet

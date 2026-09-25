@@ -65,6 +65,13 @@ node_routing() {
     ruconet_rule not fwmark "${RUCONET_TABLE}" lookup "${RUCONET_TABLE}" priority 1000
 }
 
+node_services() {
+    PORTS=$(ruconet_ports)
+    if [ -n "${PORTS}" ]; then
+        printf '        iifname "%s" ip daddr %s tcp dport { %s } accept\n' "${RUCONET_INTERFACE}" "${ADDRESS}" "${PORTS}"
+    fi
+}
+
 node_firewall() {
     node_tunnel || return 0
     nft -f - <<EOF
@@ -75,7 +82,7 @@ table inet ruconet {
         type filter hook input priority filter; policy drop;
         iif "lo" accept
         ct state established,related accept
-        iifname "${RUCONET_INTERFACE}" accept
+$(node_services)
     }
 
     chain forward {
@@ -106,14 +113,6 @@ node_unbound() {
 server:
     interface: 127.0.0.1
     access-control: 127.0.0.0/8 allow
-
-    qname-minimisation: yes
-    prefetch: yes
-    serve-expired: yes
-    infra-keep-probing: yes
-    infra-host-ttl: 60
-
-    auto-trust-anchor-file: "/var/lib/unbound/root.key"
 EOF
     for ZONE in "${DOMAIN}" "$(ruconet_reverse)"; do
         cat <<EOF
@@ -121,21 +120,18 @@ EOF
 server:
     local-zone: "${ZONE}." transparent
     domain-insecure: "${ZONE}."
-
-forward-zone:
-    name: "${ZONE}."
-    forward-addr: ${HUB_ADDRESS}
 EOF
     done
-}
+    cat <<EOF
 
-node_start() {
-    mkdir -p /var/lib/unbound
-    [ -s /var/lib/unbound/root.key ] || cp /usr/share/dns/root.key /var/lib/unbound/root.key
-    ruconet_unbound_start
+forward-zone:
+    name: "."
+    forward-addr: ${HUB_ADDRESS}
+EOF
 }
 
 node_stop() {
+    ruconet_haproxy_stop
     ruconet_unbound_stop
     exit 0
 }
@@ -193,7 +189,8 @@ node_health() {
     ip link show "${RUCONET_INTERFACE}" up > /dev/null 2>&1 \
         && [ -e "${RUCONET_RUN}/ready" ] \
         && node_handshake \
-        && ruconet_unbound_health
+        && ruconet_unbound_health \
+        && ruconet_haproxy_health
 }
 
 node_main() {
@@ -206,15 +203,20 @@ node_main() {
     ruconet_log "${NAME} public key: $(ruconet_public_key)"
 
     CURRENT=
+    SERVICES=
     node_apply || exit 1
     node_routing
-    node_firewall
+    node_firewall && SERVICES=$(ruconet_digest)
     node_connect
-    node_start
+    ruconet_unbound_start
 
     while true; do
         node_connect
         ruconet_unbound_watch
+        if [ "$(ruconet_digest)" != "${SERVICES}" ] && node_firewall; then
+            SERVICES=$(ruconet_digest)
+        fi
+        ruconet_haproxy_apply
         touch "${RUCONET_RUN}/ready"
         sleep 30 & wait $!
     done

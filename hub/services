@@ -1,0 +1,2 @@
+# TYPE    LISTEN    TARGET            OPTIONS
+server    443       127.0.0.1:8080    proxy optional timeout=1m

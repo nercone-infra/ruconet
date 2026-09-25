@@ -22,7 +22,8 @@ jobs:
   version:
     runs-on: ubuntu-24.04
     outputs:
-      nginx: ${{ steps.determine.outputs.nginx }}
+      haproxy: ${{ steps.determine.outputs.haproxy }}
+      unbound: ${{ steps.determine.outputs.unbound }}
       openssl: ${{ steps.determine.outputs.openssl }}
       openssl3: ${{ steps.determine.outputs.openssl3 }}
       trixie: ${{ steps.determine.outputs.trixie }}
@@ -34,8 +35,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          NGINX_VERSION=$(curl -fsSL "https://nginx.org/en/download.html" \
-            | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+          HAPROXY_VERSION=$(curl -fsSL "https://www.haproxy.org/download/" \
+            | grep -oE 'href="[0-9]+\.[0-9]+/"' \
+            | grep -oE '[0-9]+\.[0-9]+' \
+            | sort -V \
+            | while read -r BRANCH; do
+                curl -fsSL "https://www.haproxy.org/download/${BRANCH}/src/releases.json" 2> /dev/null \
+                  | jq -r '.latest_release // empty' 2> /dev/null \
+                  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
+              done \
+            | sort -V \
+            | tail -1)
+
+          UNBOUND_VERSION=$(curl -fsSL "https://nlnetlabs.nl/downloads/unbound/" \
+            | grep -oE 'unbound-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz"' \
             | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
             | sort -V \
             | tail -1)
@@ -53,20 +66,22 @@ jobs:
           SECURITY_HASH=$(awk '/^SHA256:/{in_sha=1; next} in_sha && / main\/binary-amd64\/Packages$/{print $1; exit}' <<< "${SECURITY_RELEASE}")
           TRIXIE_PACKAGES_VERSION="${MAIN_HASH:0:16}-${SECURITY_HASH:0:16}"
 
-          for VALUE in "${NGINX_VERSION}" "${OPENSSL_VERSION}" "${OPENSSL3_VERSION}" "${MAIN_HASH}" "${SECURITY_HASH}"; do
+          for VALUE in "${HAPROXY_VERSION}" "${UNBOUND_VERSION}" "${OPENSSL_VERSION}" "${OPENSSL3_VERSION}" "${MAIN_HASH}" "${SECURITY_HASH}"; do
             if [ -z "${VALUE}" ]; then
               echo "Failed to determine versions" >&2
               exit 1
             fi
           done
 
-          echo "Nginx ${NGINX_VERSION}"
+          echo "HAProxy ${HAPROXY_VERSION}"
+          echo "Unbound ${UNBOUND_VERSION}"
           echo "OpenSSL ${OPENSSL_VERSION}"
           echo "OpenSSL ${OPENSSL3_VERSION}"
           echo "Packages (trixie) ${TRIXIE_PACKAGES_VERSION}"
 
           {
-            echo "nginx=${NGINX_VERSION}"
+            echo "haproxy=${HAPROXY_VERSION}"
+            echo "unbound=${UNBOUND_VERSION}"
             echo "openssl=${OPENSSL_VERSION}"
             echo "openssl3=${OPENSSL3_VERSION}"
             echo "trixie=${TRIXIE_PACKAGES_VERSION}"
@@ -80,11 +95,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - hub
-          - node
-          - cert
-          - tls
+        image:
+          - target: ruconet
+            name: ruconet
+          - target: cert
+            name: ruconet-cert
         platform:
           - arch: amd64
             os: ubuntu-24.04
@@ -110,20 +125,21 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          target: ${{ matrix.target }}
+          target: ${{ matrix.image.target }}
           platforms: linux/${{ matrix.platform.arch }}
           pull: true
           build-args: |
-            NGINX_VERSION=${{ needs.version.outputs.nginx }}
+            HAPROXY_VERSION=${{ needs.version.outputs.haproxy }}
+            UNBOUND_VERSION=${{ needs.version.outputs.unbound }}
             OPENSSL_VERSION=${{ needs.version.outputs.openssl }}
             OPENSSL3_VERSION=${{ needs.version.outputs.openssl3 }}
             TRIXIE_PACKAGES_VERSION=${{ needs.version.outputs.trixie }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          outputs: type=image,name=${{ env.REGISTRY }}/ruconet-${{ matrix.target }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.platform.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-${{ matrix.platform.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image.target }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.target }}-${{ matrix.platform.arch }}
 
       - name: Export digest
         env:
@@ -135,7 +151,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: digest-${{ matrix.target }}-${{ matrix.platform.arch }}
+          name: digest-${{ matrix.image.target }}-${{ matrix.platform.arch }}
           path: digests/*
           retention-days: 1
           if-no-files-found: error
@@ -148,17 +164,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - hub
-          - node
-          - cert
-          - tls
+        image:
+          - target: ruconet
+            name: ruconet
+          - target: cert
+            name: ruconet-cert
     runs-on: ubuntu-24.04
     steps:
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: digest-${{ matrix.target }}-*
+          pattern: digest-${{ matrix.image.target }}-*
           path: digests
           merge-multiple: true
 
@@ -175,7 +191,7 @@ jobs:
       - name: Publish
         working-directory: digests
         env:
-          IMAGE: ${{ env.REGISTRY }}/ruconet-${{ matrix.target }}
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image.name }}
         run: |
           set -euo pipefail
           SOURCES=()

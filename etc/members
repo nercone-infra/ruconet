@@ -1,10 +1,9 @@
 # NAME       ADDRESS
 ruconet      10.64.0.1
 gateway      10.64.0.2
-cert         10.64.0.3
-db           10.64.0.4
-mail         10.64.0.5
-mail-relay   10.64.0.6
-gitea        10.64.0.7
-pds          10.64.0.8
-website      10.64.0.9
+db           10.64.0.3
+mail         10.64.0.4
+mail-relay   10.64.0.5
+gitea        10.64.0.6
+pds          10.64.0.7
+website      10.64.0.8
